@@ -11,7 +11,7 @@ use chrono_tz::Tz;
 // https://github.com/rust-lang/rust/issues/74465
 use once_cell::sync::OnceCell;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 use serde::{
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
@@ -64,7 +64,6 @@ pub struct Mapping {
     pub extensions: Option<Extensions>,
     pub groups: Vec<Group>,
     pub kind: FileKind,
-    pub name: String,
     pub rules: RuleKind,
 }
 
@@ -248,6 +247,7 @@ impl HunterBuilder {
                         FileKind::Jsonl => FileKind::Json,
                         FileKind::Mft => FileKind::Mft,
                         FileKind::Xml => FileKind::Xml,
+                        FileKind::Esedb => FileKind::Esedb,
                         FileKind::Unknown => unreachable!(),
                     };
                     hunts.push(Hunt {
@@ -437,19 +437,60 @@ impl HunterBuilder {
                 .collect();
         }
 
+        let mut from = None;
+        let mut to = None;
+        if let Some(timestamp) = self.from {
+            if let Some(timezone) = self.timezone {
+                let local = match timezone.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                };
+                from = Some(local.with_timezone(&Utc));
+            } else if local {
+                from = Some(match Utc.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                });
+            } else {
+                from = Some(Utc.from_utc_datetime(&timestamp));
+            }
+        }
+        if let Some(timestamp) = self.to {
+            if let Some(timezone) = self.timezone {
+                let local = match timezone.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                };
+                to = Some(local.with_timezone(&Utc));
+            } else if local {
+                to = Some(match Utc.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                });
+            } else {
+                to = Some(Utc.from_utc_datetime(&timestamp));
+            }
+        }
+
         Ok(Hunter {
             inner: HunterInner {
                 hunts,
                 fields,
                 rules,
 
-                from: self.from.map(|d| DateTime::from_utc(d, Utc)),
+                from,
                 load_unknown,
-                local,
                 preprocess,
                 skip_errors,
-                timezone: self.timezone,
-                to: self.to.map(|d| DateTime::from_utc(d, Utc)),
+                to,
             },
         })
     }
@@ -538,10 +579,8 @@ impl Mapper {
             }
         }
         let kind = if full {
-            let mut map = FxHashMap::with_capacity_and_hasher(
-                fields.len(),
-                BuildHasherDefault::<FxHasher>::default(),
-            );
+            let mut map =
+                FxHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher::default());
             for field in &fields {
                 map.insert(
                     field.from.clone(),
@@ -554,10 +593,8 @@ impl Mapper {
             }
             MapperKind::Full(map)
         } else if fast {
-            let mut map = FxHashMap::with_capacity_and_hasher(
-                fields.len(),
-                BuildHasherDefault::<FxHasher>::default(),
-            );
+            let mut map =
+                FxHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher::default());
             for field in &fields {
                 map.insert(field.from.clone(), field.to.clone());
             }
@@ -697,11 +734,9 @@ pub struct HunterInner {
     rules: BTreeMap<Uuid, Rule>,
 
     load_unknown: bool,
-    local: bool,
     preprocess: bool,
     from: Option<DateTime<Utc>>,
     skip_errors: bool,
-    timezone: Option<Tz>,
     to: Option<DateTime<Utc>>,
 }
 
@@ -753,6 +788,7 @@ impl Hunter {
                     File::Json(json) => (FileKind::Json, json.into()),
                     File::Mft(mft) => (FileKind::Mft, mft.into()),
                     File::Xml(xml) => (FileKind::Xml, xml.into()),
+                    File::Esedb(esedb) => (FileKind::Esedb, esedb.into()),
                 };
                 let mut hits = smallvec::smallvec![];
                 for hunt in &self.inner.hunts {
@@ -874,7 +910,7 @@ impl Hunter {
                                         let aggregates = aggregates
                                             .entry((hunt.id, *rid))
                                             .or_insert((aggregate, FxHashMap::default()));
-                                        let docs = aggregates.1.entry(id).or_insert(vec![]);
+                                        let docs = aggregates.1.entry(id).or_default();
                                         docs.push(document_id);
                                     } else {
                                         hits.push(Hit {
@@ -920,7 +956,7 @@ impl Hunter {
                                     let aggregates = aggregates
                                         .entry((hunt.id, hunt.id))
                                         .or_insert((aggregate, FxHashMap::default()));
-                                    let docs = aggregates.1.entry(id).or_insert(vec![]);
+                                    let docs = aggregates.1.entry(id).or_default();
                                     docs.push(document_id);
                                 } else {
                                     hits.push(Hit {
@@ -1038,35 +1074,7 @@ impl Hunter {
 
     fn skip(&self, timestamp: NaiveDateTime) -> crate::Result<bool> {
         if self.inner.from.is_some() || self.inner.to.is_some() {
-            // TODO: Not sure if this is correct...
-            let localised = if let Some(timezone) = self.inner.timezone {
-                let local = match timezone.from_local_datetime(&timestamp).single() {
-                    Some(l) => l,
-                    None => {
-                        if self.inner.skip_errors {
-                            cs_eyellowln!("failed to localise timestamp");
-                            return Ok(true);
-                        } else {
-                            anyhow::bail!("failed to localise timestamp");
-                        }
-                    }
-                };
-                local.with_timezone(&Utc)
-            } else if self.inner.local {
-                match Utc.from_local_datetime(&timestamp).single() {
-                    Some(l) => l,
-                    None => {
-                        if self.inner.skip_errors {
-                            cs_eyellowln!("failed to localise timestamp");
-                            return Ok(true);
-                        } else {
-                            anyhow::bail!("failed to localise timestamp");
-                        }
-                    }
-                }
-            } else {
-                DateTime::<Utc>::from_utc(timestamp, Utc)
-            };
+            let localised = Utc.from_utc_datetime(&timestamp);
             // Check if event is older than start date marker
             if let Some(sd) = self.inner.from {
                 if localised <= sd {
